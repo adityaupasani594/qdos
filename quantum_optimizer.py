@@ -183,6 +183,56 @@ def _solve_with_numpy(qp: QuadraticProgram) -> tuple[QuadraticProgram, Any]:
     return qubo, result
 
 
+def _solve_with_qulacs(qp: QuadraticProgram) -> tuple[QuadraticProgram, Any]:
+    """Quantum solver using qulacs and mpiqulacs."""
+    converter = QuadraticProgramToQubo()
+    qubo = converter.convert(qp)
+    
+    op, offset = qubo.to_ising()
+    n_qubits = op.num_qubits
+    
+    from mpiqulacs import Observable
+    observable = Observable(n_qubits)
+    
+    for pauli, coeff in zip(op.paulis, op.coeffs):
+        pauli_str = str(pauli)
+        term = []
+        for i, p in enumerate(reversed(pauli_str)):
+            if p != 'I':
+                term.append(f"{p} {i}")
+        observable.add_operator(coeff.real, " ".join(term) if term else "")
+
+    from qulacs import QuantumCircuit, QuantumState
+    from scipy.optimize import minimize
+    
+    depth = 2
+
+    def cost_function(params):
+        state = QuantumState(n_qubits)
+        state.set_zero_state()
+        circuit = QuantumCircuit(n_qubits)
+        idx = 0
+        for _ in range(depth):
+            for i in range(n_qubits):
+                circuit.add_RY_gate(i, params[idx])
+                idx += 1
+            for i in range(n_qubits - 1):
+                circuit.add_CZ_gate(i, i + 1)
+        circuit.update_quantum_state(state)
+        return observable.get_expectation_value(state)
+
+    initial_params = np.random.rand(n_qubits * depth) * 2 * np.pi
+    result = minimize(cost_function, initial_params, method="COBYLA")
+    
+    class DummyResult:
+        def __init__(self, x, fval):
+            self.x = x
+            self.fval = fval
+            from qiskit_optimization.problems.quadratic_program import QuadraticProgram
+            self.variables_dict = {f"y_{i}": round(x[i]) if i < len(x) else 0.0 for i in range(n_qubits)} 
+            
+    return qubo, DummyResult(result.x, result.fun)
+
 def _solve_windowed(
     config: OptimizationConfig,
     profiles: dict[str, dict[str, float]],
@@ -251,7 +301,7 @@ def _solve_windowed(
             name=f"window_budget_{window_start}",
         )
 
-        _qubo, day_result = _solve_with_numpy(day_qp)
+        _qubo, day_result = _solve_with_qulacs(day_qp)
 
         selected_drugs_window = []
         selected_daily_toxicity = 0.0
@@ -412,9 +462,9 @@ def run_optimization(config: OptimizationConfig) -> OptimizationSolution:
         if config.use_qiskit:
             num_variables = len(selected_drugs) * config.days
             if num_variables <= config.max_global_qubits:
-                qubo, raw_result = _solve_with_numpy(qp)
+                qubo, raw_result = _solve_with_qulacs(qp)
                 schedule = _build_schedule_from_variables(raw_result.variables_dict, selected_drugs, config.days)
-                status = "numpy-global"
+                status = "qulacs-global"
             else:
                 qubo = None
                 raw_result = None

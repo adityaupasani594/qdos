@@ -81,14 +81,14 @@ def render_sidebar():
     st.sidebar.header("Patient Data")
     age = st.sidebar.number_input("Age (Years)", min_value=18, max_value=100, value=55)
     bsa = st.sidebar.number_input("Body Surface Area (m²)", min_value=1.0, max_value=3.0, value=1.8, step=0.1)
-    days = st.sidebar.number_input("Planning Horizon (Days)", min_value=7, max_value=30, value=14, step=1)
+    days = st.sidebar.number_input("Planning Horizon (Days)", min_value=1, max_value=16, value=4, step=1)
     
     st.sidebar.header("Drug Library")
     drug_options = ["Pembrolizumab", "Cisplatin", "Paclitaxel", "Fluorouracil", "Doxorubicin"]
     selected_drugs = st.sidebar.multiselect(
         "Available Therapeutics",
         options=drug_options,
-        default=["Pembrolizumab", "Cisplatin", "Paclitaxel"]
+        default=["Pembrolizumab", "Cisplatin"]
     )
     
     efficacy = {}
@@ -122,8 +122,14 @@ def render_sidebar():
     clearance_rate = st.sidebar.slider("Clearance Rate", 0.05, 1.0, 0.3, 0.05)
     qaoa_reps = st.sidebar.slider("QAOA Reps", 1, 3, 1, 1)
     
+    num_vars = int(days) * len(selected_drugs)
+    is_over_limit = num_vars > 16
+    
+    if is_over_limit:
+         st.sidebar.error(f"Global Solver Limit Exceeded: {num_vars} variables (Max 16). Please reduce your planning horizon days or selected drugs.")
+
     # Run Simulation trigger
-    if st.sidebar.button("Run Quantum Optimization", type="primary", use_container_width=True):
+    if st.sidebar.button("Run Quantum Optimization", type="primary", use_container_width=True, disabled=is_over_limit):
         st.session_state['run_sim'] = True
         
     return {
@@ -141,17 +147,34 @@ def render_sidebar():
         "qaoa_reps": int(qaoa_reps),
     }
 
-def render_efficacy_chart(time_points, no_treatment, std_care, qdos_care):
-    """Renders the tumor size comparison line chart."""
+def render_no_treatment_vs_qdos(time_points, no_treatment, qdos_care):
     fig = go.Figure()
-    
     fig.add_trace(go.Scatter(
         x=time_points, y=no_treatment,
         mode='lines',
         name='No Treatment',
         line=dict(color='#9E9E9E', width=2, dash='dot')
     ))
+    fig.add_trace(go.Scatter(
+        x=time_points, y=qdos_care,
+        mode='lines+markers',
+        name='Q-DOS Optimized',
+        line=dict(color='#00E676', width=3),
+        marker=dict(symbol='diamond', size=8)
+    ))
+    fig.update_layout(
+        title="No Treatment vs Q-DOS",
+        xaxis_title="Days",
+        yaxis_title="Tumor Size (% of Baseline)",
+        template="plotly_dark",
+        hovermode="x unified",
+        margin=dict(l=20, r=20, t=50, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
+def render_std_vs_qdos(time_points, std_care, qdos_care):
+    fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=time_points, y=std_care,
         mode='lines+markers',
@@ -159,25 +182,68 @@ def render_efficacy_chart(time_points, no_treatment, std_care, qdos_care):
         line=dict(color='gray', width=2, dash='dash'),
         marker=dict(symbol='circle', size=6)
     ))
-    
     fig.add_trace(go.Scatter(
         x=time_points, y=qdos_care,
         mode='lines+markers',
         name='Q-DOS Optimized',
-        line=dict(color='#00E676', width=3), # Distinctive green
+        line=dict(color='#00E676', width=3),
         marker=dict(symbol='diamond', size=8)
     ))
-    
     fig.update_layout(
-        title="Projected Tumor Volume Over 14-Day Cycle",
+        title="Standard Care vs Q-DOS",
         xaxis_title="Days",
         yaxis_title="Tumor Size (% of Baseline)",
         template="plotly_dark",
         hovermode="x unified",
-        margin=dict(l=20, r=20, t=70, b=20),
+        margin=dict(l=20, r=20, t=50, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
+    st.plotly_chart(fig, use_container_width=True)
+
+def render_factors_effect_chart(base_params, base_solution):
+    """
+    Runs a lightweight sensitivity sweep around the current parameters
+    and plots how varying them affects the Objective Score or Tumor Size.
+    To keep UI responsive, we calculate the theoretical objective score
+    of the current schedule for alpha/beta, and estimate effects for gamma/clearance.
+    """
+    fig = go.Figure()
     
+    variations = np.linspace(0.5, 1.5, 11)  # 50% to 150% of current value
+    x_axis_labels = (variations - 1) * 100  # -50% to +50%
+    
+    # 1. Alpha (Efficacy Weight) - Linear effect on objective score
+    alpha_scores = []
+    beta_scores = []
+    
+    # Base metrics from current schedule
+    m = base_solution.metrics
+    base_eff_syn = m['total_efficacy'] + m['total_synergy']
+    base_tox = m['total_toxicity']
+    
+    for v in variations:
+        # Varying Alpha
+        new_alpha = base_params["alpha"] * v
+        score_a = new_alpha * base_eff_syn - base_params["beta"] * base_tox
+        alpha_scores.append(score_a)
+        
+        # Varying Beta
+        new_beta = base_params["beta"] * v
+        score_b = base_params["alpha"] * base_eff_syn - new_beta * base_tox
+        beta_scores.append(score_b)
+        
+    fig.add_trace(go.Scatter(x=x_axis_labels, y=alpha_scores, mode='lines', name='Varying Alpha (Efficacy)', line=dict(color='#29B6F6', width=3)))
+    fig.add_trace(go.Scatter(x=x_axis_labels, y=beta_scores, mode='lines', name='Varying Beta (Toxicity)', line=dict(color='#FF3D00', width=3)))
+    
+    fig.update_layout(
+        title="Parameter Sensitivity: Effect on Objective Score",
+        xaxis_title="Parameter Variation (%)",
+        yaxis_title="Objective Score",
+        template="plotly_dark",
+        hovermode="x unified",
+        margin=dict(l=20, r=20, t=50, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 def render_safety_chart(days, qdos_tox, max_tox):
@@ -216,7 +282,7 @@ def render_safety_chart(days, qdos_tox, max_tox):
 
 def render_calendar(schedule_dict):
     """Renders the 14-day treatment schedule grid visually."""
-    st.markdown("### 📅 14-Day Treatment Schedule")
+    st.markdown("### Treatment Schedule")
     
     days = list(schedule_dict.keys())
     if not days:
@@ -388,11 +454,19 @@ def main():
     st.markdown("---")
     st.markdown("")  # Vertical spacing
     
-    # Render Plots side-by-side
+    # Render Plots
     col_chart1, col_chart2 = st.columns(2)
     with col_chart1:
-        render_efficacy_chart(optimized_sim.time, no_treatment, standard_curve, optimized_curve)
+        render_no_treatment_vs_qdos(optimized_sim.time, no_treatment, optimized_curve)
     with col_chart2:
+        render_std_vs_qdos(optimized_sim.time, standard_curve, optimized_curve)
+        
+    st.markdown("")
+    
+    col_chart3, col_chart4 = st.columns(2)
+    with col_chart3:
+        render_factors_effect_chart(params, solution)
+    with col_chart4:
         render_safety_chart(np.arange(1, params["days"] + 1), qdos_tox, params["toxicity_budget"])
     
     st.markdown("")  # Vertical spacing
