@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional
 import numpy as np
 
 from quantum_optimizer import DEFAULT_DRUG_LIBRARY, OptimizationConfig, run_optimization
-from schedule_input import generate_standard_schedule_for_drugs
+from simulator import TumorSimulator
 
 app = FastAPI(title="Q-DOS API")
 
@@ -17,23 +17,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class DrugProfile(BaseModel):
-    efficacy: float
-    toxicity: float
-
 class PatientData(BaseModel):
-    age: int
-    bsa: float
-    days: int
-    selected_drugs: List[str]
-    efficacy: Dict[str, float]
-    toxicity: Dict[str, float]
-    toxicity_budget: float
-    alpha: float
-    beta: float
-    gamma: float
-    clearance_rate: float
-    qaoa_reps: int
+    age: int = 40
+    days: int = 14
+    selected_drugs: List[str] = ["Pembrolizumab", "Cisplatin", "Paclitaxel"]
+    patient_profile: Dict[str, float] = {"kidney": 1.0, "liver": 1.0, "marrow": 1.0, "immune": 1.0, "vascular": 1.0}
+    subtype_scores: Dict[str, float] = {"BRCA": 0.5, "PDL1": 0.5, "VEGF": 0.5}
+    mutually_exclusive_pairs: List[List[str]] = []
+    gap_constraints: Dict[str, int] = {}
+    max_drugs_per_day: int = 2
+    base_toxicity_budget: float = 10.0
 
 @app.get("/drugs")
 def get_drugs():
@@ -41,32 +34,17 @@ def get_drugs():
 
 @app.post("/simulate")
 def simulate(patient: PatientData):
-    # Prepare Drug strengths
-    def build_drug_strength_map(efficacy_dict):
-        return {d: min(2.5, max(0.2, e / 4.0)) for d, e in efficacy_dict.items()}
+    profile_with_age = {**patient.patient_profile, "age": patient.age}
     
-    drug_strengths = build_drug_strength_map(patient.efficacy)
-
-    # Prepare drug dicts for the optimizer
-    drug_efficacy = {}
-    drug_toxicity = {}
-    for d in patient.selected_drugs:
-        drug_efficacy[d] = patient.efficacy.get(d, 5.0)
-        drug_toxicity[d] = patient.toxicity.get(d, 2.0)
-
-    # 1. Run Optimization
     config = OptimizationConfig(
         days=patient.days,
         selected_drugs=patient.selected_drugs,
-        efficacy=drug_efficacy,
-        toxicity=drug_toxicity,
-        toxicity_budget=patient.toxicity_budget,
-        alpha=patient.alpha,
-        beta=patient.beta,
-        gamma=patient.gamma,
-        clearance_rate=patient.clearance_rate,
-        qaoa_reps=patient.qaoa_reps,
-        use_qiskit=True
+        patient_profile=profile_with_age,
+        subtype_scores=patient.subtype_scores,
+        mutually_exclusive_pairs=[tuple(p) for p in patient.mutually_exclusive_pairs],
+        gap_constraints=patient.gap_constraints,
+        max_drugs_per_day=patient.max_drugs_per_day,
+        base_toxicity_budget=patient.base_toxicity_budget
     )
 
     try:
@@ -74,54 +52,48 @@ def simulate(patient: PatientData):
     except Exception as e:
         return {"error": str(e)}
 
-    # Standard care baseline
-    std_care_schedule = generate_standard_schedule_for_drugs(patient.selected_drugs, patient.days)
+    simulator = TumorSimulator(
+        days=patient.days,
+        dt=1.0, # Run with 1.0 step for easier plotting on frontend to match "days"
+        patient_profile=profile_with_age,
+        subtype_scores=patient.subtype_scores
+    )
 
-    # Mock Data generation (copied from Streamlit app)
-    def fetch_tumor_size_standard_care(days: int = 14) -> np.ndarray:
-        baseline = 100.0
-        decline_rate = 0.025
-        noise = np.random.normal(0, 1.5, days)
-        tumor_size = baseline * np.exp(-decline_rate * np.arange(days)) + noise
-        return np.clip(tumor_size, 0, None)
+    t_notx, pop_notx = simulator.simulate_no_treatment()
+    t_tx, pop_tx = simulator.simulate_treatment(solution.schedule)
 
-    def fetch_tumor_size_qdos(days: int = 14) -> np.ndarray:
-        baseline = 100.0
-        decline_rate = 0.08
-        noise = np.random.normal(0, 1.0, days)
-        tumor_size = baseline * np.exp(-decline_rate * np.arange(days)) + noise
-        return np.clip(tumor_size, 0, None)
+    # Calculate daily toxicity array
+    from quantum_optimizer import get_effective_toxicity
+    budget = patient.base_toxicity_budget - 0.5 * (patient.age - 40)
+    tox_daily = np.zeros(patient.days)
+    for d in patient.selected_drugs:
+        t_eff = get_effective_toxicity(d, config)
+        if d in solution.schedule:
+            for t, val in enumerate(solution.schedule[d]):
+                tox_daily[t] += val * t_eff
+                
+    tox_qdos = tox_daily.tolist()
+    
+    # We will send the cumulative or just daily? Let's just send daily tox_qdos as it mimics current.
+    cum_tox = np.cumsum(tox_qdos).tolist() # the old plot was cumulative?
+    # Actually the old frontend says "Cumulative Toxicity (Q-DOS)", so let's send cumulative.
 
-    def fetch_cumulative_toxicity_qdos(days: int = 14, max_threshold: float = 50.0) -> np.ndarray:
-        toxicity = np.zeros(days)
-        current_tox = 15.0
-        for i in range(days):
-            step = np.random.uniform(-5.0, 15.0)
-            current_tox += step
-            current_tox *= 0.85 
-            cap = max_threshold - np.random.uniform(2.0, 5.0)
-            toxicity[i] = min(current_tox, cap)
-            toxicity[i] = max(0, toxicity[i])
-        return toxicity
-
-    tumor_std = fetch_tumor_size_standard_care(patient.days).tolist()
-    tumor_qdos = fetch_tumor_size_qdos(patient.days).tolist()
-    tox_qdos = fetch_cumulative_toxicity_qdos(patient.days, patient.toxicity_budget).tolist()
-
-    # Convert NumPy arrays to lists for JSON serialization
     serialized_schedule = {k: v.tolist() if hasattr(v, "tolist") else v for k, v in solution.schedule.items()}
-    serialized_std_schedule = {k: v.tolist() if hasattr(v, "tolist") else v for k, v in std_care_schedule.items()}
 
     return {
         "solution": {
             "schedule": serialized_schedule,
-            "metrics": solution.metrics
+            "metrics": {
+                "objective_score": solution.metrics.get("score", 0.0),
+                "total_efficacy": 0.0, # We can omit or calculate
+                "total_toxicity": sum(tox_qdos)
+            }
         },
-        "standard_schedule": serialized_std_schedule,
         "charts": {
-            "tumor_std": tumor_std,
-            "tumor_qdos": tumor_qdos,
-            "tox_qdos": tox_qdos
+            "tumor_std": pop_notx.tolist(),
+            "tumor_qdos": pop_tx.tolist(),
+            "tox_qdos": cum_tox,
+            "t_days": t_notx.tolist(),
+            "budget": budget
         }
     }
-
